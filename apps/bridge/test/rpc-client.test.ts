@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createRpcClient, PUBLIC_SOLANA_RPC, RPC_INTERVAL_MS, rpcFetch } from '../src/lib/rpc-client';
+import { createRpcClient, PUBLIC_SOLANA_RPC, RPC_INTERVAL_MS, rpcFetch, batchWithFallback, RpcError } from '../src/lib/rpc-client';
 
 function fixture(responses: Response[] = []) {
   let clock = 0;
@@ -179,6 +179,41 @@ test('batches reject uncached methods and share the 1-RPS budget', async () => {
   assert.equal(starts.length, 2);
   assert.ok(starts[1].time - starts[0].time >= RPC_INTERVAL_MS);
   assert.deepEqual(results[0].map((r) => r.cache), ['miss', 'miss']);
+});
+
+test('rejected batches fall back to individual reads on the same endpoint', async () => {
+  let batchAttempts = 0;
+  const batch = async () => {
+    batchAttempts++;
+    throw new RpcError("Maximum number of 'getTransaction' calls in a batch request is 1.", 502);
+  };
+  const singles: string[] = [];
+  const single = async (_method: string, params: unknown[]) => {
+    singles.push(String(params[0]));
+    return `tx-${params[0]}`;
+  };
+  const results = await batchWithFallback(
+    [{ method: 'getTransaction', params: ['a'] }, { method: 'getTransaction', params: ['b'] }],
+    batch, single,
+  );
+  assert.equal(batchAttempts, 1);
+  assert.deepEqual(singles, ['a', 'b']);
+  assert.deepEqual(results, ['tx-a', 'tx-b']);
+});
+
+test('failed batches reject cleanly without unhandled per-request promises', async () => {
+  let clock = 0;
+  const client = createRpcClient({
+    now: () => clock,
+    sleep: async (ms) => { clock += ms; },
+    fetch: async () => new Response('limited', { status: 429, headers: { 'retry-after': '20' } }),
+  });
+  await assert.rejects(client.callBatch([
+    { method: 'getTransaction', params: ['tx-1'] },
+    { method: 'getTransaction', params: ['tx-2'] },
+  ]), /temporarily unavailable/);
+  // Let the per-request promises settle: an unhandled rejection would fail this test.
+  await new Promise((resolve) => setTimeout(resolve, 10));
 });
 
 test('custom clients use their own endpoint and cache without falling back after failure', async () => {

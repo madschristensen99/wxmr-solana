@@ -17,7 +17,7 @@ import {
 import IDL from '@wxmr/core/idl/wxmr_bridge.json';
 import type { WxmrBridge } from '@wxmr/core/idl/wxmr_bridge';
 import { XMR_MINT } from '@wxmr/shared';
-import { knownWithdrawals, rememberWithdrawals } from '@/lib/withdrawal-storage';
+import { knownWithdrawals, rememberWithdrawals, markWithdrawalPending, markWithdrawalsResolved } from '@/lib/withdrawal-storage';
 import { readHistoryPage } from '@/lib/chain-history';
 import { buildCancelWithdrawalTransaction } from '@wxmr/core/bridge';
 
@@ -250,11 +250,21 @@ export function useWxmrBridge() {
       }
       const [configInfo, mintInfo, userTokenInfo, pendingTokenInfo, depositInfo] = infos;
       if (!configInfo || !mintInfo) throw new Error('Bridge configuration or mint is unavailable');
+      const resolvedWithdrawals: string[] = [];
       for (let i = baseAccountCount; i < infos.length; i++) {
         const info = infos[i];
-        if (!info || !info.owner.equals(PROGRAM_ID)) continue;
+        if (!info || !info.owner.equals(PROGRAM_ID)) {
+          resolvedWithdrawals.push(accountKeys[i].toBase58());
+          continue;
+        }
         const withdrawal = decodeWithdrawal(accountKeys[i], info.data);
-        if (withdrawal) snapshot.withdrawals.push(withdrawal);
+        if (withdrawal) {
+          snapshot.withdrawals.push(withdrawal);
+          if (withdrawal.status !== 'pending') resolvedWithdrawals.push(withdrawal.withdrawalPda);
+        }
+      }
+      if (wallet.publicKey && resolvedWithdrawals.length) {
+        markWithdrawalsResolved(PROGRAM_ID.toBase58(), wallet.publicKey.toBase58(), resolvedWithdrawals);
       }
 
       if (configInfo) {
@@ -370,7 +380,7 @@ export function useWxmrBridge() {
       const nonce = minimum > BigInt(Date.now()) ? minimum : BigInt(Date.now());
       const withdrawalPda = getWithdrawalPDA(wallet.publicKey, nonce);
       // Save before asking the wallet to sign: an uncertain confirmation must remain discoverable.
-      rememberWithdrawals(PROGRAM_ID.toBase58(), wallet.publicKey.toBase58(), [withdrawalPda.toBase58()]);
+      markWithdrawalPending(PROGRAM_ID.toBase58(), wallet.publicKey.toBase58(), withdrawalPda.toBase58());
 
       const signature = await program.methods
         .requestWithdrawal(new BN(nonce.toString()), new BN(amount.toString()), xmrAddress, exactOut)

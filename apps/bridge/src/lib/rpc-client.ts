@@ -203,6 +203,9 @@ export function createRpcClient(options: {
     }));
     tail = job.catch(() => {});
     const missPromises = misses.map((m) => job.then(() => results[m.index].reply));
+    // Coalesced callers await these directly; mark them handled so a failed
+    // batch does not leak unhandled rejections when only the batch is awaited.
+    for (const promise of missPromises) promise.catch(() => {});
     misses.forEach((m, i) => pending.set(m.key, missPromises[i]));
     try {
       await job;
@@ -219,10 +222,30 @@ export function createRpcClient(options: {
 
 const BROWSER_BUDGET_KEY = 'wxmr:public-rpc:next-start';
 
+const FALLBACK_SOLANA_RPCS = [
+  PUBLIC_SOLANA_RPC,
+  process.env.NEXT_PUBLIC_SOLANA_RPC_URL,
+  'https://api.mainnet-beta.solana.com',
+].filter((endpoint): endpoint is string => Boolean(endpoint));
+
 export const browserRpc = createRpcClient({
-  fetch: (...args) => {
+  fetch: async (...args) => {
     if (typeof window === 'undefined') throw new RpcError('Bridge RPC reads run in the browser');
-    return globalThis.fetch(getSolanaRpcEndpoint(PUBLIC_SOLANA_RPC), args[1]);
+    const primary = getSolanaRpcEndpoint(PUBLIC_SOLANA_RPC);
+    const endpoints = [primary, ...FALLBACK_SOLANA_RPCS.filter((endpoint) => endpoint !== primary)];
+    let lastResponse: Response | undefined;
+    let lastError: unknown;
+    for (const endpoint of endpoints) {
+      try {
+        const response = await globalThis.fetch(endpoint, { ...(args[1] ?? {}), signal: AbortSignal.timeout(12_000) });
+        if (response.ok) return response;
+        lastResponse = response;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    if (lastResponse) return lastResponse;
+    throw lastError instanceof Error ? lastError : new RpcError('Solana RPC request failed.', 502);
   },
   runExclusive: async (job) => {
     if (typeof navigator !== 'undefined' && navigator.locks) {
@@ -266,4 +289,20 @@ export async function rpcBatchResult<T>(requests: Array<{ method: string; params
     if (reply.error) throw new RpcError(reply.error.message, 502);
     return reply.result as T;
   });
+}
+
+// Some endpoints (e.g. PublicNode) reject batches of certain methods. Try the
+// batch first, then fall back to individual reads on the same selected endpoint.
+export async function batchWithFallback<T>(
+  requests: Array<{ method: string; params: unknown[] }>,
+  batch: (requests: Array<{ method: string; params: unknown[] }>) => Promise<T[]>,
+  single: (method: string, params: unknown[]) => Promise<T>,
+): Promise<T[]> {
+  try {
+    return await batch(requests);
+  } catch {
+    const results: T[] = [];
+    for (const { method, params } of requests) results.push(await single(method, params));
+    return results;
+  }
 }

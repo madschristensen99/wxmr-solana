@@ -2,7 +2,7 @@ import { Buffer } from 'buffer';
 import { PublicKey } from '@solana/web3.js';
 import { utils } from '@coral-xyz/anchor';
 import IDL from '@wxmr/core/idl/wxmr_bridge.json';
-import { rpcResult, rpcBatchResult, RpcError } from './rpc-client';
+import { rpcResult, rpcBatchResult, batchWithFallback, RpcError } from './rpc-client';
 
 export const BRIDGE_PROGRAM = new PublicKey(
   process.env.NEXT_PUBLIC_BRIDGE_PROGRAM_ID || 'EzBkC8P5wxab9kwrtV5hRdynHAfB5w3UPcPXNgMseVA8',
@@ -52,12 +52,16 @@ export async function readHistoryPage(address: PublicKey, kind: 'audit' | 'withd
   );
   const addresses = new Set<string>();
   // One batched request for the whole page: a single budget slot and HTTP call.
+  // Endpoints that reject getTransaction batches fall back to individual reads.
   const entries = signatures.filter((entry) => !entry.err);
-  const transactions = await rpcBatchResult<HistoryTransaction | null>(
-    entries.map((entry) => ({
-      method: 'getTransaction',
-      params: [entry.signature, { encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 0 }],
-    })),
+  const requests = entries.map((entry) => ({
+    method: 'getTransaction',
+    params: [entry.signature, { encoding: 'jsonParsed', commitment: 'finalized', maxSupportedTransactionVersion: 0 }],
+  }));
+  const transactions = await batchWithFallback<HistoryTransaction | null>(
+    requests,
+    (batchRequests) => rpcBatchResult<HistoryTransaction | null>(batchRequests),
+    (method, params) => rpcResult<HistoryTransaction | null>(method, params),
   );
   for (let i = 0; i < transactions.length; i++) {
     const transaction = transactions[i];
